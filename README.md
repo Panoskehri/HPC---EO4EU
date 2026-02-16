@@ -1,0 +1,11 @@
+Example .env file
+
+# .env file
+SLURM_USER=
+SLURM_PASS=
+SLURM_HOST=
+SLURM_SCRIPT=
+JOB_SCRIPT=
+JOB_INPUT=
+
+
