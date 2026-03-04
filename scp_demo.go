@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,31 +14,80 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+type Transfer struct {
+	Local  string
+	Remote string
+}
+
+type Pair struct {
+	LocalFiles  []string
+	RemoteFiles []string
+}
+
+func CreatePairs(local, remote [][]string) []Pair {
+	pairs := make([]Pair, len(local))
+	for i := range local {
+		pairs[i] = Pair{LocalFiles: local[i], RemoteFiles: remote[i]}
+	}
+	return pairs
+}
+
+func GetRemotePaths(dir string, files []string) []string {
+	remoteFiles := make([]string, len(files))
+	for i := range files {
+		remoteFiles[i] = filepath.Join(dir, filepath.Base(files[i]))
+	}
+	return remoteFiles
+}
+
+func GetTransfers(localFiles [][]string, remoteFiles [][]string) []Transfer {
+	var transfers []Transfer
+	pairs := CreatePairs(localFiles, remoteFiles)
+
+	for _, pair := range pairs {
+		for i := range pair.LocalFiles {
+			transfers = append(transfers, Transfer{pair.LocalFiles[i], pair.RemoteFiles[i]})
+		}
+	}
+
+	return transfers
+}
+
+func CopyFileSCP(client scp.Client, local string, remote string) error {
+	f, err := os.Open(local)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return client.CopyFile(context.Background(), f, remote, "0755")
+}
+
 func main() {
-	// 1. Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment")
 	}
 
+	// Load SSH credentials
 	user := os.Getenv("SLURM_USER")
 	pass := os.Getenv("SLURM_PASS")
 	host := os.Getenv("SLURM_HOST")
 
-	// Local file paths from your .env
-	localSlurmReq := os.Getenv("SLURM_SCRIPT") // e.g., job.sh
-	localJobScript := os.Getenv("JOB_SCRIPT")  // e.g., job_script.py
-	localJobInput := os.Getenv("JOB_INPUT")    // e.g., data.csv
-
-	// Remote paths , needed for scp, subject to change
-	remotebatchscript := "/home/" + user + "/job.sbatch"
-	remoteJobScript := "/home/" + user + "/job_script.py"
-	remoteJobInput := "/home/" + user + "/job_input.txt"
-
 	if user == "" || pass == "" || host == "" {
-		log.Fatal("Essential environment variables are missing!")
+		log.Fatal("SSH credentials are missing!")
 	}
 
-	// 2. SSH Configuration
+	// Local file paths
+	localBatchScripts := strings.Split(os.Getenv("BATCH_SCRIPTS"), ":")
+	localJobScripts := strings.Split(os.Getenv("JOB_SCRIPTS"), ":")
+	localJobInputs := strings.Split(os.Getenv("JOB_INPUTS"), ":")
+
+	// Remote file paths (needed for SCP)
+	workdir := os.Getenv("SLURM_WORKDIR")
+	remoteBatchScripts := GetRemotePaths(workdir, localBatchScripts)
+	remoteJobScripts := GetRemotePaths(workdir, localJobScripts)
+	remoteJobInputs := GetRemotePaths(workdir, localJobInputs)
+
+	// SSH Configuration
 	config := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)}, // subject to change
@@ -45,89 +95,67 @@ func main() {
 		Timeout:         10 * time.Second,
 	}
 
-	// 3. Connect
+	// Connect to SSH
 	client, err := ssh.Dial("tcp", host, config)
 	if err != nil {
 		log.Fatalf("Failed to dial: %v", err)
 	}
 	defer client.Close()
 
-	// 4. Initialize SCP
+	// Initialize SCP
 	scpClient, err := scp.NewClientBySSH(client)
 	if err != nil {
 		log.Fatalf("Error creating SCP client: %v", err)
 	}
 
-	// Define a slice of transfers to handle them all at once
-	type transfer struct {
-		local  string
-		remote string
-	}
-
-	// Remote paths , needed for scp
-	// Subject to change based on HPC filesystem structure and user home directory(and future project logic)
-	transfers := []transfer{
-		{localSlurmReq, remotebatchscript},
-		{localJobScript, remoteJobScript},
-		{localJobInput, remoteJobInput},
-	}
-
-	// Print out the planned transfers for verification
-	for _, t := range transfers {
-		fmt.Printf("Local: %s, Remote: %s\n", t.local, t.remote)
-	}
+	// Create transfer pairs of local-remote files for SCP
+	transfers := GetTransfers([][]string{localBatchScripts, localJobScripts, localJobInputs}, [][]string{remoteBatchScripts, remoteJobScripts, remoteJobInputs})
 
 	fmt.Println("Starting full file transfer...")
 
+	// Copy each local file to remote via SCP
 	for _, t := range transfers {
-		if t.local == "" {
-			continue // Skip if the env variable wasn't set
+		if t.Local == "" {
+			continue
 		}
-
-		err := func() error {
-			f, err := os.Open(t.local)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-
-			return scpClient.CopyFile(context.Background(), f, t.remote, "0755")
-		}()
-
+		err := CopyFileSCP(scpClient, t.Local, t.Remote)
 		if err != nil {
-			log.Fatalf("Failed to upload %s: %v", t.local, err)
+			log.Fatalf("Failed to upload %s: %v", t.Local, err)
+		} else {
+			fmt.Printf("Successfully uploaded %s to %s\n", t.Local, t.Remote)
 		}
-		fmt.Printf("Successfully uploaded %s to %s\n", t.local, t.remote)
 	}
 
-	fmt.Println("All transfers complete!")
+	fmt.Println("Transfers complete!")
 
-	// New session for command execution
-	session, err := client.NewSession()
-	if err != nil {
-		log.Fatalf("Failed to create session for sbatch: %v", err)
-	}
-	defer session.Close()
+	// TODO: (1) unzip dataset, (2) κράτα το πρώτο slurm script και να κάνεις sbatch αυτό
 
-	remoteSbatchPath := "/home/" + user + "/job.sbatch"
-	cmd := fmt.Sprintf("sbatch %s", remoteSbatchPath)
+	// // New session for command execution
+	// session, err := client.NewSession()
+	// if err != nil {
+	// 	log.Fatalf("Failed to create session for sbatch: %v", err)
+	// }
+	// defer session.Close()
 
-	output, err := session.CombinedOutput(cmd)
-	if err != nil {
-		log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, string(output))
-	}
+	// remoteSbatchPath := workdir + "/job.sbatch"
+	// cmd := fmt.Sprintf("sbatch %s", remoteSbatchPath)
 
-	// Example output: "Submitted batch job 12345"
-	sbatchResult := string(output)
-	fmt.Printf("Slurm Output: %s", sbatchResult)
+	// output, err := session.CombinedOutput(cmd)
+	// if err != nil {
+	// 	log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, string(output))
+	// }
 
-	// Extracting JobID for later polling (Assuming: "Submitted batch job 12345")
-	fields := strings.Fields(sbatchResult)
-	jobID := "-1"
-	if len(fields) > 0 {
-		jobID = fields[len(fields)-1]
-		fmt.Printf("Job successfully queued with ID: %s\n", jobID)
-	}
+	// // Example output: "Submitted batch job 12345"
+	// sbatchResult := string(output)
+	// fmt.Printf("Slurm Output: %s", sbatchResult)
+
+	// // Extracting JobID for later polling (Assuming: "Submitted batch job 12345")
+	// fields := strings.Fields(sbatchResult)
+	// jobID := "-1"
+	// if len(fields) > 0 {
+	// 	jobID = fields[len(fields)-1]
+	// 	fmt.Printf("Job successfully queued with ID: %s\n", jobID)
+	// }
 
 	// JOB SUBMISSION COMPLETE
 	// OUTPUT RETRIEVAL LOGIC, to be completed
