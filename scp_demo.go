@@ -62,6 +62,33 @@ func CopyFileSCP(client scp.Client, local string, remote string) error {
 	return client.CopyFile(context.Background(), f, remote, "0755")
 }
 
+func ConnectToSSH(user string, pass string, host string) (*ssh.Client, error) {
+	config := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.Password(pass)}, // subject to change
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", host, config)
+	return client, err
+}
+
+func TransferData(client scp.Client, transfers []Transfer) error {
+	for _, t := range transfers {
+		if t.Local == "" {
+			continue
+		}
+		err := CopyFileSCP(client, t.Local, t.Remote)
+		if err != nil {
+			log.Fatalf("Failed to upload %s: %v", t.Local, err)
+			return err
+		} else {
+			fmt.Printf("Successfully uploaded %s to %s\n", t.Local, t.Remote)
+		}
+	}
+	return nil
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment")
@@ -87,23 +114,15 @@ func main() {
 	remoteJobScripts := GetRemotePaths(workdir, localJobScripts)
 	remoteJobInputs := GetRemotePaths(workdir, localJobInputs)
 
-	// SSH Configuration
-	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(pass)}, // subject to change
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-
-	// Connect to SSH
-	client, err := ssh.Dial("tcp", host, config)
+	// Initialize SSH client
+	sshClient, err := ConnectToSSH(user, pass, host)
 	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
+		log.Fatalf("Failed to connect to SSH client: %v", err)
 	}
-	defer client.Close()
+	defer sshClient.Close()
 
-	// Initialize SCP
-	scpClient, err := scp.NewClientBySSH(client)
+	// Initialize SCP client
+	scpClient, err := scp.NewClientBySSH(sshClient)
 	if err != nil {
 		log.Fatalf("Error creating SCP client: %v", err)
 	}
@@ -111,51 +130,39 @@ func main() {
 	// Create transfer pairs of local-remote files for SCP
 	transfers := GetTransfers([][]string{localBatchScripts, localJobScripts, localJobInputs}, [][]string{remoteBatchScripts, remoteJobScripts, remoteJobInputs})
 
-	fmt.Println("Starting full file transfer...")
-
-	// Copy each local file to remote via SCP
-	for _, t := range transfers {
-		if t.Local == "" {
-			continue
-		}
-		err := CopyFileSCP(scpClient, t.Local, t.Remote)
-		if err != nil {
-			log.Fatalf("Failed to upload %s: %v", t.Local, err)
-		} else {
-			fmt.Printf("Successfully uploaded %s to %s\n", t.Local, t.Remote)
-		}
+	// // Transfer all local files to remote via SCP
+	fmt.Println("Starting data transfer...")
+	err = TransferData(scpClient, transfers)
+	if err != nil {
+		log.Fatalf("Error while transfering data: %v", err)
 	}
-
 	fmt.Println("Transfers complete!")
 
-	// TODO: (1) unzip dataset, (2) κράτα το πρώτο slurm script και να κάνεις sbatch αυτό
+	// TODO: (1) unzip dataset
 
-	// // New session for command execution
-	// session, err := client.NewSession()
-	// if err != nil {
-	// 	log.Fatalf("Failed to create session for sbatch: %v", err)
-	// }
-	// defer session.Close()
+	// New session for remote command execution
+	session, err := sshClient.NewSession()
+	if err != nil {
+		log.Fatalf("Failed to create session: %v", err)
+	}
+	defer session.Close()
 
-	// remoteSbatchPath := workdir + "/job.sbatch"
-	// cmd := fmt.Sprintf("sbatch %s", remoteSbatchPath)
+	// Submit batch script to slurm
+	batchScript := remoteBatchScripts[0]                         // always sbatch the first one
+	cmd := fmt.Sprintf("cd %s; sbatch %s", workdir, batchScript) // cd to working directory first
+	output, err := session.CombinedOutput(cmd)
+	if err != nil {
+		log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, string(output))
+	}
 
-	// output, err := session.CombinedOutput(cmd)
-	// if err != nil {
-	// 	log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, string(output))
-	// }
-
-	// // Example output: "Submitted batch job 12345"
-	// sbatchResult := string(output)
-	// fmt.Printf("Slurm Output: %s", sbatchResult)
-
-	// // Extracting JobID for later polling (Assuming: "Submitted batch job 12345")
-	// fields := strings.Fields(sbatchResult)
-	// jobID := "-1"
-	// if len(fields) > 0 {
-	// 	jobID = fields[len(fields)-1]
-	// 	fmt.Printf("Job successfully queued with ID: %s\n", jobID)
-	// }
+	// Extracting JobID for later polling (assuming "Submitted batch job xxxx" format)
+	sbatchResult := string(output)
+	fields := strings.Fields(sbatchResult)
+	jobID := "-1"
+	if len(fields) > 0 {
+		jobID = fields[len(fields)-1]
+		fmt.Printf("Job successfully queued with ID: %s\n", jobID)
+	}
 
 	// JOB SUBMISSION COMPLETE
 	// OUTPUT RETRIEVAL LOGIC, to be completed
@@ -163,7 +170,7 @@ func main() {
 	// fmt.Println("Waiting 15 seconds for job processing...")
 	// time.Sleep(120 * time.Second)
 
-	// remoteOutputFile := fmt.Sprintf("/home/%s/job-%s.out", user, jobID)
+	// remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
 	// localOutputFile := fmt.Sprintf("job_output_%s.log", jobID)
 
 	// fmt.Printf("Attempting to download output from: %s\n", remoteOutputFile)
@@ -180,5 +187,4 @@ func main() {
 	// } else {
 	// 	fmt.Printf("Successfully downloaded job output to: %s\n", localOutputFile)
 	// }
-
 }
