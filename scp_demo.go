@@ -181,6 +181,40 @@ func GetJobIDs(client *ssh.Client, file string) ([]string, error) {
 	return ids, nil
 }
 
+func GetLogFiles(workdir string, ids []string) []string {
+	logFiles := make([]string, 0, 2*len(ids))
+	for _, id := range ids {
+		logFiles = append(logFiles, fmt.Sprintf("result_%s.log", id))
+		logFiles = append(logFiles, fmt.Sprintf("result_%s.err", id))
+	}
+	return GetRemotePaths(workdir, logFiles)
+}
+
+func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles []string, results_file string) error {
+	// Compressing output data
+	cmd := CompressOutputsCmd(remoteOutputFiles, results_file)
+	output, err := ExecuteCmd(sshClient, cmd)
+	if err != nil {
+		return fmt.Errorf("Compression of output data failed: %v\nOutput: %s", err, output)
+	}
+	fmt.Printf("Compressed all output data to %s\n", results_file)
+
+	// Donwload output data locally
+	fmt.Printf("Attempting to download output data from: %s\n", results_file)
+	destFile, err := os.Create(filepath.Base(results_file))
+	if err != nil {
+		return fmt.Errorf("Failed to create local output file: %v", err)
+	}
+	defer destFile.Close()
+	err = scpClient.CopyFromRemote(context.Background(), destFile, results_file)
+	if err != nil {
+		return fmt.Errorf("Could not download output data: %v\n", err)
+	} else {
+		fmt.Printf("Successfully downloaded job output to: %s\n", destFile.Name())
+	}
+	return nil
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment")
@@ -267,13 +301,14 @@ func main() {
 	// Chech if job completed successfuly by checking .err file
 	errFile := filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
 	if HasErrorOutput(sshClient, errFile) {
-		log.Fatalf("Job %s completed with error", jobID) // TODO: download error files
+		log.Fatalf("Job %s completed with error", jobID)
 	}
 	fmt.Printf("Job %s completed with success\n", jobID)
 
 	// Get list of job ids that were submitted by the batch script
 	logFile := filepath.Join(workdir, fmt.Sprintf("result_%s.log", jobID))
 	ids, err := GetJobIDs(sshClient, logFile)
+	ids = append([]string{jobID}, ids...) // include the submitted job also
 	if err != nil {
 		log.Fatalf("Failed to get list of job IDs submitted by job %s: %s", jobID, err)
 	}
@@ -288,34 +323,20 @@ func main() {
 		log.Fatalf("Job %s terminated with state: %s", jobID, state)
 	}
 
-	// Chech if job completed successfuly by checking .err file
+	// Check if job completed successfuly by checking .err file
 	errFile = filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
 	if HasErrorOutput(sshClient, errFile) {
 		log.Fatalf("Job %s completed with error", jobID) // TODO: download error files
 	}
 	fmt.Printf("Job %s completed with success\n", jobID)
 
-	// Compressing output data
+	// Downloading all output data locally
 	results_file := filepath.Join(workdir, os.Getenv("RESULTS"))
 	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
-	cmd = CompressOutputsCmd(remoteOutputFiles, results_file)
-	output, err = ExecuteCmd(sshClient, cmd)
+	remoteOutputFiles = append(remoteOutputFiles, GetLogFiles(workdir, ids)...)
+	err = DownloadData(sshClient, scpClient, remoteOutputFiles, results_file)
 	if err != nil {
-		log.Fatalf("Compression of output data failed: %v\nOutput: %s", err, output)
+		log.Fatalf("Download of data failed: %s", err)
 	}
-	fmt.Printf("Compressed all output data to %s\n", results_file)
-
-	// Donwload locally output data
-	fmt.Printf("Attempting to download output data from: %s\n", results_file)
-	destFile, err := os.Create(filepath.Base(results_file))
-	if err != nil {
-		log.Fatalf("Failed to create local output file: %v", err)
-	}
-	defer destFile.Close()
-	err = scpClient.CopyFromRemote(context.Background(), destFile, results_file)
-	if err != nil {
-		fmt.Printf("Could not download output data: %v\n", err)
-	} else {
-		fmt.Printf("Successfully downloaded job output to: %s\n", destFile.Name())
-	}
+	fmt.Println("Downloaded all data locally")
 }
