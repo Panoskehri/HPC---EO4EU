@@ -120,10 +120,16 @@ func ExecuteCmd(client *ssh.Client, cmd string) (string, error) {
 	return string(output), err
 }
 
-func HasErrorOutput(client *ssh.Client, file string) bool {
+func HasErrorOutput(client *ssh.Client, file string) bool { // return error also
 	cmd := fmt.Sprintf("{ [ ! -e %s ] || [ -s %s ]; } && echo 'error' || echo 'no_error'", file, file)
 	output, _ := ExecuteCmd(client, cmd)
 	return strings.TrimSpace(output) == "error"
+}
+
+func ExistFile(client *ssh.Client, file string) bool { // return error also
+	cmd := fmt.Sprintf("[ -e %s ] && echo 'exist' || echo 'not_exist'", file)
+	output, _ := ExecuteCmd(client, cmd)
+	return strings.TrimSpace(output) == "exist"
 }
 
 func GetPendingReason(info string) string {
@@ -181,13 +187,19 @@ func GetJobIDs(client *ssh.Client, file string) ([]string, error) {
 	return ids, nil
 }
 
-func GetLogFiles(workdir string, ids []string) []string {
+func GetLogFiles(client *ssh.Client, workdir string, ids []string) []string { // return error also
 	logFiles := make([]string, 0, 2*len(ids))
 	for _, id := range ids {
-		logFiles = append(logFiles, fmt.Sprintf("result_%s.log", id))
-		logFiles = append(logFiles, fmt.Sprintf("result_%s.err", id))
+		logFile := filepath.Join(workdir, fmt.Sprintf("result_%s.log", id))
+		if ExistFile(client, logFile) {
+			logFiles = append(logFiles, logFile)
+		}
+		errFile := filepath.Join(workdir, fmt.Sprintf("result_%s.err", id))
+		if ExistFile(client, errFile) {
+			logFiles = append(logFiles, errFile)
+		}
 	}
-	return GetRemotePaths(workdir, logFiles)
+	return logFiles
 }
 
 func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles []string, results_file string) error {
@@ -333,7 +345,7 @@ func main() {
 	// Downloading all output data locally
 	results_file := filepath.Join(workdir, os.Getenv("RESULTS"))
 	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
-	remoteOutputFiles = append(remoteOutputFiles, GetLogFiles(workdir, ids)...)
+	remoteOutputFiles = append(remoteOutputFiles, GetLogFiles(sshClient, workdir, ids)...)
 	err = DownloadData(sshClient, scpClient, remoteOutputFiles, results_file)
 	if err != nil {
 		log.Fatalf("Download of data failed: %s", err)
