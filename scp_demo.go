@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -89,6 +90,97 @@ func TransferData(client scp.Client, transfers []Transfer) error {
 	return nil
 }
 
+func UncompressInputsCmd(inputs []string) string {
+	cmd := ""
+	for _, input := range inputs {
+		if strings.HasSuffix(input, ".zip") {
+			cmd += fmt.Sprintf("unzip %s;", input)
+		} else if strings.HasSuffix(input, "tar.gz") {
+			cmd += fmt.Sprintf("tar -zxvf %s;", input)
+		}
+	}
+	return cmd
+}
+
+func CompressOutputsCmd(outputs []string, file string) string {
+	cmd := fmt.Sprintf("tar -czvf %s ", file)
+	for _, output := range outputs {
+		cmd += fmt.Sprintf("%s ", output)
+	}
+	return cmd
+}
+
+func ExecuteCmd(client *ssh.Client, cmd string) (string, error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return "", err
+	}
+	defer session.Close()
+	output, err := session.CombinedOutput(cmd)
+	return string(output), err
+}
+
+func HasErrorOutput(client *ssh.Client, file string) bool {
+	cmd := fmt.Sprintf("{ [ ! -e %s ] || [ -s %s ]; } && echo 'error' || echo 'no_error'", file, file)
+	output, _ := ExecuteCmd(client, cmd)
+	return strings.TrimSpace(output) == "error"
+}
+
+func GetPendingReason(info string) string {
+	re := regexp.MustCompile(`Reason=([^\s]+)`)
+	match := re.FindStringSubmatch(info)
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+func PollingJobCompletion(client *ssh.Client, id string) (string, error) {
+	state := ""
+	for true {
+		cmd := fmt.Sprintf("scontrol show job %s", id)
+		output, err := ExecuteCmd(client, cmd)
+		if err != nil {
+			return state, fmt.Errorf("scontrol execution for job %s failed: %v\nOutput: %s", id, err, output)
+		}
+
+		re := regexp.MustCompile(`JobState=([^\s]+)`)
+		match := re.FindStringSubmatch(output)
+		if len(match) > 1 {
+			state = match[1]
+			fmt.Println("Job State:", state)
+		} else {
+			return state, fmt.Errorf("job %s state not found", id)
+		}
+
+		if state == "PENDING" && GetPendingReason(output) == "DependencyNeverSatisfied" { // when afterok dependency is used (job has to be cancelled)
+			return fmt.Sprint("PENDING (DependencyNeverSatisfied)"), nil
+		} else if state != "PENDING" && state != "PREEMPTED" && state != "RUNNING" && state != "SUSPENDED" {
+			return state, nil
+		} else {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	return state, nil
+}
+
+func GetJobIDs(client *ssh.Client, file string) ([]string, error) {
+	cmd := fmt.Sprintf("cat %s", file)
+	output, err := ExecuteCmd(client, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("cat file %s execution failed: %v\nOutput: %s", file, err, output)
+	}
+	re := regexp.MustCompile(`Job ID:\s*(\d+)`)
+	matches := re.FindAllStringSubmatch(output, -1)
+	ids := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			ids = append(ids, match[1])
+		}
+	}
+	return ids, nil
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system environment")
@@ -138,24 +230,23 @@ func main() {
 	}
 	fmt.Println("Transfers complete!")
 
-	// TODO: (1) unzip dataset
-
-	// New session for remote command execution
-	session, err := sshClient.NewSession()
+	// Uncompress input data
+	cmd := fmt.Sprintf("cd %s;%s", workdir, UncompressInputsCmd(remoteJobInputs)) // cd to working directory first
+	output, err := ExecuteCmd(sshClient, cmd)
 	if err != nil {
-		log.Fatalf("Failed to create session: %v", err)
+		log.Fatalf("Uncompression of input data failed: %v\nOutput: %s", err, output)
 	}
-	defer session.Close()
+	fmt.Println("Uncompressed all input data!")
 
 	// Submit batch script to slurm
-	batchScript := remoteBatchScripts[0]                         // always sbatch the first one
-	cmd := fmt.Sprintf("cd %s; sbatch %s", workdir, batchScript) // cd to working directory first
-	output, err := session.CombinedOutput(cmd)
+	batchScript := remoteBatchScripts[0] // always sbatch the first one
+	cmd = fmt.Sprintf("sbatch %s", batchScript)
+	output, err = ExecuteCmd(sshClient, cmd)
 	if err != nil {
-		log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, string(output))
+		log.Fatalf("sbatch execution failed: %v\nOutput: %s", err, output)
 	}
 
-	// Extracting JobID for later polling (assuming "Submitted batch job xxxx" format)
+	// Extracting job ID (assuming "Submitted batch job xxxx" format)
 	sbatchResult := string(output)
 	fields := strings.Fields(sbatchResult)
 	jobID := "-1"
@@ -164,27 +255,67 @@ func main() {
 		fmt.Printf("Job successfully queued with ID: %s\n", jobID)
 	}
 
-	// JOB SUBMISSION COMPLETE
-	// OUTPUT RETRIEVAL LOGIC, to be completed
+	// Get job's state through polling
+	fmt.Printf("Retrieving job %s state...\n", jobID)
+	state, err := PollingJobCompletion(sshClient, jobID)
+	if err != nil {
+		log.Fatalf("Job %s polling failed: %s", jobID, err)
+	} else if state != "COMPLETED" {
+		log.Fatalf("Job %s terminated with state: %s", jobID, state)
+	}
 
-	// fmt.Println("Waiting 15 seconds for job processing...")
-	// time.Sleep(120 * time.Second)
+	// Chech if job completed successfuly by checking .err file
+	errFile := filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
+	if HasErrorOutput(sshClient, errFile) {
+		log.Fatalf("Job %s completed with error", jobID) // TODO: download error files
+	}
+	fmt.Printf("Job %s completed with success\n", jobID)
 
-	// remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
-	// localOutputFile := fmt.Sprintf("job_output_%s.log", jobID)
+	// Get list of job ids that were submitted by the batch script
+	logFile := filepath.Join(workdir, fmt.Sprintf("result_%s.log", jobID))
+	ids, err := GetJobIDs(sshClient, logFile)
+	if err != nil {
+		log.Fatalf("Failed to get list of job IDs submitted by job %s: %s", jobID, err)
+	}
 
-	// fmt.Printf("Attempting to download output from: %s\n", remoteOutputFile)
+	// Get last job's state through polling (assuming chained dependency between all the jobs)
+	jobID = ids[len(ids)-1]
+	fmt.Printf("Retrieving job %s state...\n", jobID)
+	state, err = PollingJobCompletion(sshClient, jobID)
+	if err != nil {
+		log.Fatalf("Job %s polling failed: %s", jobID, err)
+	} else if state != "COMPLETED" {
+		log.Fatalf("Job %s terminated with state: %s", jobID, state)
+	}
 
-	// destFile, err := os.Create(localOutputFile)
-	// if err != nil {
-	// 	log.Fatalf("Failed to create local output file: %v", err)
-	// }
-	// defer destFile.Close()
+	// Chech if job completed successfuly by checking .err file
+	errFile = filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
+	if HasErrorOutput(sshClient, errFile) {
+		log.Fatalf("Job %s completed with error", jobID) // TODO: download error files
+	}
+	fmt.Printf("Job %s completed with success\n", jobID)
 
-	// err = scpClient.CopyFromRemote(context.Background(), destFile, remoteOutputFile)
-	// if err != nil {
-	// 	fmt.Printf("Note: Could not download output yet (Job might still be pending): %v\n", err)
-	// } else {
-	// 	fmt.Printf("Successfully downloaded job output to: %s\n", localOutputFile)
-	// }
+	// Compressing output data
+	results_file := filepath.Join(workdir, os.Getenv("RESULTS"))
+	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
+	cmd = CompressOutputsCmd(remoteOutputFiles, results_file)
+	output, err = ExecuteCmd(sshClient, cmd)
+	if err != nil {
+		log.Fatalf("Compression of output data failed: %v\nOutput: %s", err, output)
+	}
+	fmt.Printf("Compressed all output data to %s\n", results_file)
+
+	// Donwload locally output data
+	fmt.Printf("Attempting to download output data from: %s\n", results_file)
+	destFile, err := os.Create(filepath.Base(results_file))
+	if err != nil {
+		log.Fatalf("Failed to create local output file: %v", err)
+	}
+	defer destFile.Close()
+	err = scpClient.CopyFromRemote(context.Background(), destFile, results_file)
+	if err != nil {
+		fmt.Printf("Could not download output data: %v\n", err)
+	} else {
+		fmt.Printf("Successfully downloaded job output to: %s\n", destFile.Name())
+	}
 }
