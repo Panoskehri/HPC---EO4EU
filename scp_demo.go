@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -126,10 +127,13 @@ func HasErrorOutput(client *ssh.Client, file string) bool { // return error also
 	return strings.TrimSpace(output) == "error"
 }
 
-func ExistFile(client *ssh.Client, file string) bool { // return error also
+func ExistFile(client *ssh.Client, file string) (bool, error) {
 	cmd := fmt.Sprintf("[ -e %s ] && echo 'exist' || echo 'not_exist'", file)
-	output, _ := ExecuteCmd(client, cmd)
-	return strings.TrimSpace(output) == "exist"
+	output, err := ExecuteCmd(client, cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(output) == "exist", nil
 }
 
 func GetPendingReason(info string) string {
@@ -187,24 +191,32 @@ func GetJobIDs(client *ssh.Client, file string) ([]string, error) {
 	return ids, nil
 }
 
-func GetLogFiles(client *ssh.Client, workdir string, ids []string) []string { // return error also
+func GetLogFiles(client *ssh.Client, workdir string, ids []string) []string {
 	logFiles := make([]string, 0, 2*len(ids))
 	for _, id := range ids {
 		logFile := filepath.Join(workdir, fmt.Sprintf("result_%s.log", id))
-		if ExistFile(client, logFile) {
-			logFiles = append(logFiles, logFile)
-		}
 		errFile := filepath.Join(workdir, fmt.Sprintf("result_%s.err", id))
-		if ExistFile(client, errFile) {
-			logFiles = append(logFiles, errFile)
-		}
+		logFiles = append(logFiles, logFile)
+		logFiles = append(logFiles, errFile)
 	}
 	return logFiles
 }
 
 func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles []string, results_file string) error {
-	// Compressing output data
-	cmd := CompressOutputsCmd(remoteOutputFiles, results_file)
+	// Keep only files and directories that exist
+	existingOutputFiles := make([]string, 0, len(remoteOutputFiles))
+	for _, file := range remoteOutputFiles {
+		exist, err := ExistFile(sshClient, file)
+		if err != nil {
+			return err
+		}
+		if exist {
+			existingOutputFiles = append(existingOutputFiles, file)
+		}
+	}
+
+	// Compress output data
+	cmd := CompressOutputsCmd(existingOutputFiles, results_file)
 	output, err := ExecuteCmd(sshClient, cmd)
 	if err != nil {
 		return fmt.Errorf("Compression of output data failed: %v\nOutput: %s", err, output)
@@ -223,6 +235,50 @@ func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles
 		return fmt.Errorf("Could not download output data: %v\n", err)
 	} else {
 		fmt.Printf("Successfully downloaded job output to: %s\n", destFile.Name())
+	}
+	return nil
+}
+
+func ExtractJobDetails(client *ssh.Client, id string) (string, error) {
+	var firstLine, stateLine string
+	cmd := fmt.Sprintf("scontrol show job %s", id)
+	output, err := ExecuteCmd(client, cmd)
+	if err != nil {
+		return "", fmt.Errorf("scontrol execution for job %s failed: %v\nOutput: %s", id, err, output)
+	}
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	isFirst := true
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if isFirst {
+			firstLine = line
+			isFirst = false
+			continue
+		}
+		if strings.HasPrefix(line, "JobState=") {
+			stateLine = line
+			break
+		}
+	}
+	return fmt.Sprintf("%s %s", firstLine, stateLine), nil
+}
+
+func SaveJobStatuses(client *ssh.Client, ids []string, file string) error {
+	statuses := ""
+	for _, id := range ids {
+		status, err := ExtractJobDetails(client, id)
+		if err != nil {
+			return fmt.Errorf("Could not save job statuses: %s", err)
+		}
+		statuses += status + "\n"
+	}
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("Could not save job statuses: %s", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(statuses); err != nil {
+		return fmt.Errorf("Could not save job statuses: %s", err)
 	}
 	return nil
 }
@@ -251,6 +307,11 @@ func main() {
 	remoteBatchScripts := GetRemotePaths(workdir, localBatchScripts)
 	remoteJobScripts := GetRemotePaths(workdir, localJobScripts)
 	remoteJobInputs := GetRemotePaths(workdir, localJobInputs)
+
+	// Remote file paths (needed when the submitted job(s) complete or fail)
+	jobStatus := os.Getenv("JOB_STATUS")
+	results_file := os.Getenv("RESULTS")
+	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
 
 	// Initialize SSH client
 	sshClient, err := ConnectToSSH(user, pass, host)
@@ -307,15 +368,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Job %s polling failed: %s", jobID, err)
 	} else if state != "COMPLETED" {
+		err = SaveJobStatuses(sshClient, []string{jobID}, jobStatus)
+		if err != nil {
+			log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
+		}
+		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, []string{jobID}), results_file)
+		if err != nil {
+			log.Fatalf("Download of data failed: %s", err)
+		}
+		fmt.Println("Downloaded all data locally")
 		log.Fatalf("Job %s terminated with state: %s", jobID, state)
 	}
-
-	// Chech if job completed successfuly by checking .err file
-	errFile := filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
-	if HasErrorOutput(sshClient, errFile) {
-		log.Fatalf("Job %s completed with error", jobID)
-	}
-	fmt.Printf("Job %s completed with success\n", jobID)
 
 	// Get list of job ids that were submitted by the batch script
 	logFile := filepath.Join(workdir, fmt.Sprintf("result_%s.log", jobID))
@@ -332,20 +395,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("Job %s polling failed: %s", jobID, err)
 	} else if state != "COMPLETED" {
+		err = SaveJobStatuses(sshClient, ids, jobStatus)
+		if err != nil {
+			log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
+		}
+		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, ids), results_file)
+		if err != nil {
+			log.Fatalf("Download of data failed: %s", err)
+		}
+		fmt.Println("Downloaded all data locally")
 		log.Fatalf("Job %s terminated with state: %s", jobID, state)
 	}
 
-	// Check if job completed successfuly by checking .err file
-	errFile = filepath.Join(workdir, fmt.Sprintf("result_%s.err", jobID))
-	if HasErrorOutput(sshClient, errFile) {
-		log.Fatalf("Job %s completed with error", jobID) // TODO: download error files
-	}
-	fmt.Printf("Job %s completed with success\n", jobID)
-
 	// Downloading all output data locally
-	results_file := filepath.Join(workdir, os.Getenv("RESULTS"))
-	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
 	remoteOutputFiles = append(remoteOutputFiles, GetLogFiles(sshClient, workdir, ids)...)
+	err = SaveJobStatuses(sshClient, ids, jobStatus)
+	if err != nil {
+		log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
+	}
 	err = DownloadData(sshClient, scpClient, remoteOutputFiles, results_file)
 	if err != nil {
 		log.Fatalf("Download of data failed: %s", err)
