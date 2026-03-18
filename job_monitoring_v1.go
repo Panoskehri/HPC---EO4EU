@@ -40,7 +40,7 @@ func PollingJobCompletion(client *ssh.Client, id string) (string, error) {
 		}
 
 		if state == "PENDING" && GetPendingReason(output) == "DependencyNeverSatisfied" { // when afterok dependency is used (job has to be cancelled)
-			return fmt.Sprint("PENDING (DependencyNeverSatisfied)"), nil
+			return "PENDING (DependencyNeverSatisfied)", nil
 		} else if state != "PENDING" && state != "PREEMPTED" && state != "RUNNING" && state != "SUSPENDED" {
 			return state, nil
 		} else {
