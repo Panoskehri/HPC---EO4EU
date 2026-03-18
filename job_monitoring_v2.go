@@ -1,0 +1,116 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+)
+
+func GetPendingReasonV2(client *ssh.Client, id string) (string, error) {
+	reason := ""
+	cmd := fmt.Sprintf("squeue -j %s", id)
+	output, err := ExecuteCmd(client, cmd)
+	if err != nil {
+		return reason, fmt.Errorf("squeue execution for job %s failed: %v\nOutput: %s", id, err, output)
+	}
+	re := regexp.MustCompile(`\((.*?)\)`)
+	lines := strings.SplitSeq(strings.TrimSpace(output), "\n")
+	for line := range lines {
+		if strings.Contains(line, "JOBID") { // skip the header line
+			continue
+		}
+		match := re.FindStringSubmatch(line)
+		if len(match) > 1 {
+			reason := match[1]
+			return reason, nil
+		}
+	}
+	return reason, nil
+}
+
+func PollingJobCompletionV2(client *ssh.Client, id string) (string, error) {
+	state := ""
+	for true {
+		cmd := fmt.Sprintf("sacct -j %s", id)
+		output, err := ExecuteCmd(client, cmd)
+		if err != nil {
+			return state, fmt.Errorf("sacct execution for job %s failed: %v\nOutput: %s", id, err, output)
+		}
+
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		if len(lines) < 3 { // skip line 0 (headers) and line 1 (dashes)
+			return state, fmt.Errorf("not enough lines to parse")
+		}
+		fields := strings.Fields(lines[2]) //first actual data line
+		if len(fields) >= 7 {
+			state = fields[5]
+		} else {
+			return state, fmt.Errorf("not enough fields to parse")
+		}
+
+		if state == "PENDING" { // when afterok dependency is used (job has to be cancelled)
+			reason, err := GetPendingReasonV2(client, id)
+			if err != nil {
+				return state, err
+			}
+			if reason == "DependencyNeverSatisfied" {
+				return "PENDING (DependencyNeverSatisfied)", nil
+			}
+		} else if state != "PENDING" && state != "PREEMPTED" && state != "RUNNING" && state != "SUSPENDED" {
+			return state, nil
+		} else {
+			time.Sleep(60 * time.Second)
+		}
+	}
+	return state, nil
+}
+
+func ExtractJobDetailsV2(client *ssh.Client, id string) (string, error) {
+	jobName := ""
+	partition := ""
+	state := ""
+	exitCode := ""
+	cmd := fmt.Sprintf("sacct -j %s", id)
+	output, err := ExecuteCmd(client, cmd)
+	if err != nil {
+		return "", fmt.Errorf("sacct execution for job %s failed: %v\nOutput: %s", id, err, output)
+	}
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) < 3 { // skip line 0 (headers) and line 1 (dashes)
+		return "", fmt.Errorf("not enough lines to parse")
+	}
+	fields := strings.Fields(lines[2]) //first actual data line
+	if len(fields) >= 7 {
+		jobName = fields[1]
+		partition = fields[2]
+		state = fields[5]
+		exitCode = fields[6]
+	} else {
+		return "", fmt.Errorf("not enough fields to parse")
+	}
+	return fmt.Sprintf("JobID:%s JobName:%s Partition:%s State:%s ExitCode:%s", id, jobName, partition, state, exitCode), nil
+}
+
+func SaveJobStatusesV2(client *ssh.Client, ids []string, file string) error {
+	statuses := ""
+	for _, id := range ids {
+		status, err := ExtractJobDetailsV2(client, id)
+		if err != nil {
+			return fmt.Errorf("Could not save job statuses: %s", err)
+		}
+		statuses += status + "\n"
+	}
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("Could not save job statuses: %s", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(statuses); err != nil {
+		return fmt.Errorf("Could not save job statuses: %s", err)
+	}
+	return nil
+}
