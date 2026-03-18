@@ -75,6 +75,34 @@ func ConnectToSSH(user string, pass string, host string) (*ssh.Client, error) {
 	return client, err
 }
 
+func GetKeyAuth(path string) (ssh.AuthMethod, error) {
+	key, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read private key: %v", err)
+	}
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse private key: %v", err)
+	}
+	return ssh.PublicKeys(signer), nil
+}
+
+func ConnectToSSHKey(user string, keyPath string, host string) (*ssh.Client, error) {
+	authMethod, err := GetKeyAuth(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("ssh auth setup failed: %v", err)
+	}
+	config := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			authMethod,
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // keep this for testing, but use ssh.CheckHostKey for production!
+	}
+	client, err := ssh.Dial("tcp", host, config)
+	return client, err
+}
+
 func TransferData(client scp.Client, transfers []Transfer) error {
 	for _, t := range transfers {
 		if t.Local == "" {
@@ -292,6 +320,7 @@ func main() {
 	user := os.Getenv("SLURM_USER")
 	pass := os.Getenv("SLURM_PASS")
 	host := os.Getenv("SLURM_HOST")
+	key := os.Getenv("SLURM_KEY")
 
 	if user == "" || pass == "" || host == "" {
 		log.Fatal("SSH credentials are missing!")
@@ -314,7 +343,7 @@ func main() {
 	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
 
 	// Initialize SSH client
-	sshClient, err := ConnectToSSH(user, pass, host)
+	sshClient, err := ConnectToSSHKey(user, key, host)
 	if err != nil {
 		log.Fatalf("Failed to connect to SSH client: %v", err)
 	}
@@ -329,7 +358,7 @@ func main() {
 	// Create transfer pairs of local-remote files for SCP
 	transfers := GetTransfers([][]string{localBatchScripts, localJobScripts, localJobInputs}, [][]string{remoteBatchScripts, remoteJobScripts, remoteJobInputs})
 
-	// // Transfer all local files to remote via SCP
+	// Transfer all local files to remote via SCP
 	fmt.Println("Starting data transfer...")
 	err = TransferData(scpClient, transfers)
 	if err != nil {
