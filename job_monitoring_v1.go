@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,10 @@ func GetPendingReason(info string) string {
 }
 
 func PollingJobCompletion(client *ssh.Client, id string) (string, error) {
+	interval, err := strconv.Atoi(PollingInterval)
+	if err != nil {
+		interval = 900 // default if conversion fails
+	}
 	state := ""
 	for true {
 		cmd := fmt.Sprintf("scontrol show job %s", id)
@@ -43,9 +48,8 @@ func PollingJobCompletion(client *ssh.Client, id string) (string, error) {
 			return "PENDING (DependencyNeverSatisfied)", nil
 		} else if state != "PENDING" && state != "PREEMPTED" && state != "RUNNING" && state != "SUSPENDED" {
 			return state, nil
-		} else {
-			time.Sleep(60 * time.Second)
 		}
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
 	return state, nil
 }

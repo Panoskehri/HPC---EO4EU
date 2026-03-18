@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
+
+var PollingInterval = os.Getenv("POLLING_INTERVAL")
+var InitialPollingInterval = 10
 
 func GetPendingReasonV2(client *ssh.Client, id string) (string, error) {
 	reason := ""
@@ -33,7 +37,12 @@ func GetPendingReasonV2(client *ssh.Client, id string) (string, error) {
 }
 
 func PollingJobCompletionV2(client *ssh.Client, id string) (string, error) {
+	interval, err := strconv.Atoi(PollingInterval)
+	if err != nil {
+		interval = 900 // default if conversion fails
+	}
 	state := ""
+	time.Sleep(time.Duration(InitialPollingInterval) * time.Second) // needed to wait a little bit for sacct to return something
 	for true {
 		cmd := fmt.Sprintf("sacct -j %s -p", id)
 		output, err := ExecuteCmd(client, cmd)
@@ -57,14 +66,17 @@ func PollingJobCompletionV2(client *ssh.Client, id string) (string, error) {
 			if err != nil {
 				return state, err
 			}
+			fmt.Printf("Job State: PENDING (%s)\n", reason)
 			if reason == "DependencyNeverSatisfied" {
 				return "PENDING (DependencyNeverSatisfied)", nil
 			}
 		} else if state != "PENDING" && state != "PREEMPTED" && state != "RUNNING" && state != "SUSPENDED" {
+			fmt.Println("Job State:", state)
 			return state, nil
 		} else {
-			time.Sleep(60 * time.Second)
+			fmt.Println("Job State:", state)
 		}
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
 	return state, nil
 }

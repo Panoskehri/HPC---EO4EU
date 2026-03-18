@@ -93,7 +93,7 @@ func main() {
 
 	// Get job's state through polling
 	fmt.Printf("Retrieving job %s state...\n", jobID)
-	state, err := PollingJobCompletion(sshClient, jobID)
+	state, err := PollingJobCompletionV2(sshClient, jobID)
 	if err != nil {
 		log.Fatalf("Job %s polling failed: %s", jobID, err)
 	} else if state != "COMPLETED" {
