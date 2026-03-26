@@ -1,0 +1,46 @@
+{
+    "WorkflowID": "fusion",
+    "Account": "pa260303",
+    "Workdir": "/work/pr019/chandr",
+    "Homedir": "/users/pr019/chandr",
+    "DataLocation": "",
+    "Memory": "8G",
+	"Partition": "fat",
+    "Steps": [
+        {
+            "Input": "downloads/source/",
+            "Output": "results_step1/",
+            "ImageRegistry": "",
+            "Image": "fusion.sif",
+            "Directives": {
+                "JobName": "fusion",
+                "Partition": "fat",
+                "Memory": "16G",
+                "Nodes": "1",
+                "Tasks": "1",
+                "CpusPerTask": "4",
+                "Time": "00:10:00"
+            },
+            "OptionalEnvVars": {
+                "METAINFO": "/work/pr019/chandr/fusion/downloads/source/metainfo.json",
+                "TEMP": "placeholder text"
+            }
+        },
+        {
+            "Input": "results_step1/output/",
+            "Output": "results_step2/",
+            "ImageRegistry": "",
+            "Image": "process_tiff.sif",
+            "Directives": {
+                "JobName": "process_tiff",
+                "Partition": "fat",
+                "Memory": "16G",
+                "Nodes": "1",
+                "Tasks": "1",
+                "CpusPerTask": "4",
+                "Time": "00:10:00"
+            },
+            "OptionalEnvVars": {}
+        }
+    ]
+}
