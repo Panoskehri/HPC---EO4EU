@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,29 +19,48 @@ func main() {
 
 	// Load SSH credentials
 	user := os.Getenv("SLURM_USER")
-	pass := os.Getenv("SLURM_PASS")
 	host := os.Getenv("SLURM_HOST")
 	key := os.Getenv("SLURM_KEY")
 
-	if user == "" || pass == "" || host == "" {
+	if user == "" || key == "" || host == "" {
 		log.Fatal("SSH credentials are missing!")
 	}
 
+	// Load file holding workflow schema
+	schemaPath := os.Getenv("WORKFLOW_SCHEMA")
+	file, err := os.ReadFile(schemaPath)
+	if err != nil {
+		log.Fatalf("error reading schema file %s: %v", schemaPath, err)
+	}
+
+	// Load workflow schema
+	var schema Schema
+	if err := json.Unmarshal(file, &schema); err != nil {
+		log.Fatalf("error parsing json: %v", err)
+	}
+
 	// Local file paths
-	localBatchScripts := strings.Split(os.Getenv("BATCH_SCRIPTS"), ":")
-	localJobScripts := strings.Split(os.Getenv("JOB_SCRIPTS"), ":")
-	localJobInputs := strings.Split(os.Getenv("JOB_INPUTS"), ":")
+	localBatchScripts, err := GetBatchScripts(schema, "templates/submit_tmpl.sh", "templates/step_tmpl.sh")
+	if err != nil {
+		log.Fatalf("error getting batch scripts from workflow %s: %v", schema.WorkflowID, err)
+	}
+	// localImages := GetImages(schema)
+	// localJobInputs := GetDatalocation(schema)
+	localImages := []string{}
+	localJobInputs := []string{}
 
 	// Remote file paths (needed for SCP)
-	workdir := os.Getenv("SLURM_WORKDIR")
+	workdir := filepath.Join(schema.Workdir, schema.WorkflowID)
 	remoteBatchScripts := GetRemotePaths(workdir, localBatchScripts)
-	remoteJobScripts := GetRemotePaths(workdir, localJobScripts)
+	remoteImages := GetRemotePaths(workdir, localImages)
 	remoteJobInputs := GetRemotePaths(workdir, localJobInputs)
 
 	// Remote file paths (needed when the submitted job(s) complete or fail)
-	jobStatus := os.Getenv("JOB_STATUS")
-	results_file := os.Getenv("RESULTS")
-	remoteOutputFiles := strings.Split(os.Getenv("JOB_OUTPUTS"), ":")
+	jobStatus := filepath.Join(schema.WorkflowID, os.Getenv("JOB_STATUS"))
+	remoteResults := filepath.Join(schema.Workdir, schema.WorkflowID, os.Getenv("RESULTS"))
+	localResults := filepath.Join(schema.WorkflowID, os.Getenv("RESULTS"))
+	// remoteOutputFiles := GetOutputs(schema)
+	remoteOutputFiles := []string{}
 
 	// Initialize SSH client
 	sshClient, err := ConnectToSSHKey(user, key, host)
@@ -56,7 +76,7 @@ func main() {
 	}
 
 	// Create transfer pairs of local-remote files for SCP
-	transfers := GetTransfers([][]string{localBatchScripts, localJobScripts, localJobInputs}, [][]string{remoteBatchScripts, remoteJobScripts, remoteJobInputs})
+	transfers := GetTransfers([][]string{localBatchScripts, localImages, localJobInputs}, [][]string{remoteBatchScripts, remoteImages, remoteJobInputs})
 
 	// Transfer all local files to remote via SCP
 	fmt.Println("Starting data transfer...")
@@ -101,7 +121,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
 		}
-		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, []string{jobID}), results_file)
+		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, []string{jobID}), remoteResults, localResults)
 		if err != nil {
 			log.Fatalf("Download of data failed: %s", err)
 		}
@@ -128,7 +148,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
 		}
-		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, ids), results_file)
+		err = DownloadData(sshClient, scpClient, GetLogFiles(sshClient, workdir, ids), remoteResults, localResults)
 		if err != nil {
 			log.Fatalf("Download of data failed: %s", err)
 		}
@@ -142,7 +162,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to save status of jobs to %s: %s", jobStatus, err)
 	}
-	err = DownloadData(sshClient, scpClient, remoteOutputFiles, results_file)
+	err = DownloadData(sshClient, scpClient, remoteOutputFiles, remoteResults, localResults)
 	if err != nil {
 		log.Fatalf("Download of data failed: %s", err)
 	}

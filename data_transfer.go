@@ -75,7 +75,7 @@ func TransferData(client scp.Client, transfers []Transfer) error {
 	return nil
 }
 
-func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles []string, results_file string) error {
+func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles []string, results_file string, dest string) error {
 	// Keep only files and directories that exist
 	existingOutputFiles := make([]string, 0, len(remoteOutputFiles))
 	for _, file := range remoteOutputFiles {
@@ -98,7 +98,7 @@ func DownloadData(sshClient *ssh.Client, scpClient scp.Client, remoteOutputFiles
 
 	// Donwload output data locally
 	fmt.Printf("Attempting to download output data from: %s\n", results_file)
-	destFile, err := os.Create(filepath.Base(results_file))
+	destFile, err := os.Create(dest)
 	if err != nil {
 		return fmt.Errorf("Failed to create local output file: %v", err)
 	}
